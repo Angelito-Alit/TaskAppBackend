@@ -100,6 +100,9 @@ const checkMasterRole = async (req, res, next) => {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
 };
+app.get('/', (req, res) => {
+  res.json({ message: 'API de TaskApp Manager funcionando correctamente' });
+});
 
 app.post('/api/auth/register', async (req, res) => {
   try {
