@@ -226,7 +226,7 @@ app.put('/api/users/:id', authenticateToken, checkMasterRole, async (req, res) =
   }
 });
 
-app.post('/api/create-master', async (req, res) => {
+app.post('/api/create-master', authenticateToken, checkMasterRole, async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
