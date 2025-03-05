@@ -1,81 +1,38 @@
 const express = require('express');
-const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const admin = require('firebase-admin');
 
 const app = express();
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
+
 app.use(cors({
   origin: process.env.FRONTEND_URL || '*',
   credentials: true
 }));
-app.use(bodyParser.json()); 
+app.use(bodyParser.json());
 
-const MONGODB_URI = process.env.MONGODB_URI;
-mongoose.connect(MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
+const serviceAccount = {
+  "type": "service_account",
+  "project_id": "backendtasksmanager",
+  "private_key_id": "1dae0d35db29eaaf6e77f8ebf9f79317eb33a400",
+  "private_key": process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : "",
+  "client_email": "firebase-adminsdk-fbsvc@backendtasksmanager.iam.gserviceaccount.com",
+  "client_id": "117461456523032019041",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40backendtasksmanager.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+};
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
 });
 
-const db = mongoose.connection;
-db.on('error', console.error.bind(console, 'Error de conexión a MongoDB:'));
-db.once('open', () => {
-  console.log('Conectado a MongoDB');
-});
-
-const userSchema = new mongoose.Schema({
-  username: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-  last_login: { type: Date, default: Date.now },
-  role: { type: String, enum: ['user', 'master'], default: 'user' }
-});
-
-const User = mongoose.model('User', userSchema);
-
-const taskSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  status: { type: String, required: true },
-  description: { type: String },
-  deadline: { type: Date },
-  category: { type: String },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, 
-});
-
-const Task = mongoose.model('Task', taskSchema);
-
-const groupSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  admin: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  createdAt: { type: Date, default: Date.now },
-});
-
-const Group = mongoose.model('Group', groupSchema);
-
-const collaboratorSchema = new mongoose.Schema({
-  groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  role: { type: String, enum: ['admin', 'collaborator'], default: 'collaborator' },
-});
-
-const Collaborator = mongoose.model('Collaborator', collaboratorSchema);
-
-const groupTaskSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  status: { type: String, required: true },
-  description: { type: String },
-  deadline: { type: Date },
-  category: { type: String },
-  groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, 
-  completedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  completedAt: { type: Date },
-});
-
-const GroupTask = mongoose.model('GroupTask', groupTaskSchema);
+const db = admin.firestore();
 
 const authenticateToken = (req, res, next) => {
   const token = req.header('Authorization')?.split(' ')[1];
@@ -91,8 +48,10 @@ const authenticateToken = (req, res, next) => {
 
 const checkMasterRole = async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.userId);
-    if (!user || user.role !== 'master') {
+    const userRef = db.collection('users').doc(req.user.userId);
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists || userDoc.data().role !== 'master') {
       return res.status(403).json({ message: 'Acceso denegado. Se requiere rol de master.' });
     }
     next();
@@ -100,6 +59,7 @@ const checkMasterRole = async (req, res, next) => {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
 };
+
 app.get('/', (req, res) => {
   res.json({ message: 'API de TaskApp Manager funcionando correctamente' });
 });
@@ -108,21 +68,25 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, email, password } = req.body;
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.where('email', '==', email).get();
+    
+    if (!snapshot.empty) {
       return res.status(400).json({ message: 'El usuario ya existe' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const newUser = new User({
+    const newUser = {
       username,
       email,
       password: hashedPassword,
-    });
+      last_login: admin.firestore.Timestamp.now(),
+      role: 'user'
+    };
 
-    await newUser.save();
-    res.status(201).json({ message: 'Usuario registrado exitosamente' });
+    const docRef = await usersRef.add(newUser);
+    res.status(201).json({ message: 'Usuario registrado exitosamente', userId: docRef.id });
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
@@ -132,27 +96,34 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email });
-    if (!user) {
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.where('email', '==', email).get();
+    
+    if (snapshot.empty) {
       return res.status(400).json({ message: 'Usuario no encontrado' });
     }
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
+    const userDoc = snapshot.docs[0];
+    const userData = userDoc.data();
+
+    const isPasswordValid = await bcrypt.compare(password, userData.password);
     if (!isPasswordValid) {
       return res.status(400).json({ message: 'Contraseña incorrecta' });
     }
 
-    const token = jwt.sign({ userId: user._id, email: user.email }, process.env.JWT_SECRET, {
+    const token = jwt.sign({ userId: userDoc.id, email: userData.email }, process.env.JWT_SECRET, {
       expiresIn: '1h',
     });
 
-    user.last_login = Date.now();
-    await user.save();
+    await userDoc.ref.update({
+      last_login: admin.firestore.Timestamp.now()
+    });
+
     res.status(200).json({ 
       message: 'Inicio de sesión exitoso', 
       token, 
-      userId: user._id,
-      role: user.role
+      userId: userDoc.id,
+      role: userData.role
     });
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
@@ -168,17 +139,27 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const { username, email } = req.body;
     
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { username, email },
-      { new: true }
-    ).select('-password');
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
     
-    if (!updatedUser) {
+    if (!userDoc.exists) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    res.status(200).json({ message: 'Perfil actualizado exitosamente', user: updatedUser });
+    await userRef.update({ username, email });
+    
+    const updatedUserDoc = await userRef.get();
+    const userData = updatedUserDoc.data();
+    
+    const userWithoutPassword = {
+      id: updatedUserDoc.id,
+      username: userData.username,
+      email: userData.email,
+      role: userData.role,
+      last_login: userData.last_login
+    };
+    
+    res.status(200).json({ message: 'Perfil actualizado exitosamente', user: userWithoutPassword });
   } catch (error) {
     res.status(500).json({ message: 'Error al actualizar el perfil', error: error.message });
   }
@@ -186,11 +167,23 @@ app.put('/api/users/profile', authenticateToken, async (req, res) => {
 
 app.get('/api/users/me', authenticateToken, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId).select('-password');
-    if (!user) {
+    const userRef = db.collection('users').doc(req.user.userId);
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
-    res.status(200).json(user);
+    
+    const userData = userDoc.data();
+    const userWithoutPassword = {
+      id: userDoc.id,
+      username: userData.username,
+      email: userData.email,
+      role: userData.role,
+      last_login: userData.last_login
+    };
+    
+    res.status(200).json(userWithoutPassword);
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
@@ -198,7 +191,21 @@ app.get('/api/users/me', authenticateToken, async (req, res) => {
 
 app.get('/api/users', authenticateToken, checkMasterRole, async (req, res) => {
   try {
-    const users = await User.find().select('-password');
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.get();
+    
+    const users = [];
+    snapshot.forEach(doc => {
+      const userData = doc.data();
+      users.push({
+        id: doc.id,
+        username: userData.username,
+        email: userData.email,
+        role: userData.role,
+        last_login: userData.last_login
+      });
+    });
+    
     res.status(200).json(users);
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
@@ -210,17 +217,27 @@ app.put('/api/users/:id', authenticateToken, checkMasterRole, async (req, res) =
     const { id } = req.params;
     const { username, email, role } = req.body;
     
-    const updatedUser = await User.findByIdAndUpdate(
-      id,
-      { username, email, role },
-      { new: true }
-    ).select('-password');
+    const userRef = db.collection('users').doc(id);
+    const userDoc = await userRef.get();
     
-    if (!updatedUser) {
+    if (!userDoc.exists) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
     
-    res.status(200).json({ message: 'Usuario actualizado exitosamente', user: updatedUser });
+    await userRef.update({ username, email, role });
+    
+    const updatedUserDoc = await userRef.get();
+    const userData = updatedUserDoc.data();
+    
+    const userWithoutPassword = {
+      id: updatedUserDoc.id,
+      username: userData.username,
+      email: userData.email,
+      role: userData.role,
+      last_login: userData.last_login
+    };
+    
+    res.status(200).json({ message: 'Usuario actualizado exitosamente', user: userWithoutPassword });
   } catch (error) {
     res.status(500).json({ message: 'Error al actualizar el usuario', error: error.message });
   }
@@ -230,21 +247,24 @@ app.post('/api/create-master', authenticateToken, checkMasterRole, async (req, r
   try {
     const { username, email, password } = req.body;
 
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.where('email', '==', email).get();
+    
+    if (!snapshot.empty) {
       return res.status(400).json({ message: 'El usuario ya existe' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const newUser = new User({
+    const newUser = {
       username,
       email,
       password: hashedPassword,
+      last_login: admin.firestore.Timestamp.now(),
       role: 'master'
-    });
+    };
 
-    await newUser.save();
+    await usersRef.add(newUser);
     res.status(201).json({ message: 'Usuario master creado exitosamente' });
   } catch (error) {
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
@@ -253,7 +273,17 @@ app.post('/api/create-master', authenticateToken, checkMasterRole, async (req, r
 
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
-    const tasks = await Task.find({ userId: req.user.userId });
+    const tasksRef = db.collection('tasks');
+    const snapshot = await tasksRef.where('userId', '==', req.user.userId).get();
+    
+    const tasks = [];
+    snapshot.forEach(doc => {
+      tasks.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+    
     res.status(200).json(tasks);
   } catch (error) {
     res.status(500).json({ message: 'Error al obtener las tareas', error: error.message });
@@ -264,36 +294,55 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
   try {
     const { name, status, description, deadline, category } = req.body;
 
-    const newTask = new Task({
+    const newTask = {
       name,
       status,
       description,
-      deadline,
+      deadline: deadline ? new Date(deadline) : null,
       category,
-      userId: req.user.userId, 
-    });
+      userId: req.user.userId,
+    };
 
-    await newTask.save();
-    res.status(201).json({ message: 'Tarea agregada exitosamente', task: newTask });
+    const docRef = await db.collection('tasks').add(newTask);
+    const taskWithId = { id: docRef.id, ...newTask };
+    
+    res.status(201).json({ message: 'Tarea agregada exitosamente', task: taskWithId });
   } catch (error) {
     res.status(500).json({ message: 'Error al agregar la tarea', error: error.message });
   }
 });
+
 app.put('/api/tasks/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, status, description, deadline, category } = req.body;
 
-    const updatedTask = await Task.findByIdAndUpdate(
-      id,
-      { name, status, description, deadline, category },
-      { new: true }
-    );
-
-    if (!updatedTask) {
+    const taskRef = db.collection('tasks').doc(id);
+    const taskDoc = await taskRef.get();
+    
+    if (!taskDoc.exists) {
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
-
+    
+    const updateData = {
+      name,
+      status,
+      description,
+      category
+    };
+    
+    if (deadline) {
+      updateData.deadline = new Date(deadline);
+    }
+    
+    await taskRef.update(updateData);
+    
+    const updatedTaskDoc = await taskRef.get();
+    const updatedTask = {
+      id: updatedTaskDoc.id,
+      ...updatedTaskDoc.data()
+    };
+    
     res.status(200).json({ message: 'Tarea actualizada exitosamente', task: updatedTask });
   } catch (error) {
     res.status(500).json({ message: 'Error al actualizar la tarea', error: error.message });
@@ -304,22 +353,24 @@ app.post('/api/groups', authenticateToken, async (req, res) => {
   try {
     const { name } = req.body;
 
-    const newGroup = new Group({
+    const newGroup = {
       name,
       admin: req.user.userId,
-    });
+      createdAt: admin.firestore.Timestamp.now()
+    };
 
-    await newGroup.save();
+    const groupRef = await db.collection('groups').add(newGroup);
+    const groupWithId = { id: groupRef.id, ...newGroup };
 
-    const newCollaborator = new Collaborator({
-      groupId: newGroup._id,
+    const newCollaborator = {
+      groupId: groupRef.id,
       userId: req.user.userId,
-      role: 'admin',
-    });
+      role: 'admin'
+    };
 
-    await newCollaborator.save();
+    await db.collection('collaborators').add(newCollaborator);
 
-    res.status(201).json({ message: 'Grupo creado exitosamente', group: newGroup });
+    res.status(201).json({ message: 'Grupo creado exitosamente', group: groupWithId });
   } catch (error) {
     res.status(500).json({ message: 'Error al crear el grupo', error: error.message });
   }
@@ -330,34 +381,45 @@ app.post('/api/groups/:groupId/collaborators', authenticateToken, async (req, re
     const { groupId } = req.params;
     const { email } = req.body;
 
-    const adminCollaborator = await Collaborator.findOne({
-      groupId,
-      userId: req.user.userId,
-      role: 'admin',
-    });
+    const collaboratorsRef = db.collection('collaborators');
+    const adminSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', req.user.userId)
+      .where('role', '==', 'admin')
+      .get();
 
-    if (!adminCollaborator) {
+    if (adminSnapshot.empty) {
       return res.status(403).json({ message: 'Solo el administrador puede agregar colaboradores' });
     }
 
-    const user = await User.findOne({ email });
-    if (!user) {
+    const usersRef = db.collection('users');
+    const userSnapshot = await usersRef.where('email', '==', email).get();
+    
+    if (userSnapshot.empty) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
-
-    const existingCollaborator = await Collaborator.findOne({ groupId, userId: user._id });
-    if (existingCollaborator) {
+    
+    const userDoc = userSnapshot.docs[0];
+    
+    const existingCollabSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', userDoc.id)
+      .get();
+      
+    if (!existingCollabSnapshot.empty) {
       return res.status(400).json({ message: 'El usuario ya es colaborador en este grupo' });
     }
 
-    const newCollaborator = new Collaborator({
+    const newCollaborator = {
       groupId,
-      userId: user._id,
-      role: 'collaborator',
-    });
+      userId: userDoc.id,
+      role: 'collaborator'
+    };
 
-    await newCollaborator.save();
-    res.status(201).json({ message: 'Colaborador añadido exitosamente', collaborator: newCollaborator });
+    const collabRef = await collaboratorsRef.add(newCollaborator);
+    const collaboratorWithId = { id: collabRef.id, ...newCollaborator };
+    
+    res.status(201).json({ message: 'Colaborador añadido exitosamente', collaborator: collaboratorWithId });
   } catch (error) {
     res.status(500).json({ message: 'Error al añadir colaborador', error: error.message });
   }
@@ -367,32 +429,84 @@ app.get('/api/groups/:groupId/collaborators', authenticateToken, async (req, res
   try {
     const { groupId } = req.params;
 
-    const group = await Group.findById(groupId);
-    if (!group) {
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    
+    if (!groupDoc.exists) {
       return res.status(404).json({ message: 'Grupo no encontrado' });
     }
 
-    const collaborators = await Collaborator.find({ groupId }).populate('userId', 'username email');
+    const collaboratorsRef = db.collection('collaborators');
+    const snapshot = await collaboratorsRef.where('groupId', '==', groupId).get();
+    
+    const usersRef = db.collection('users');
+    const collaborators = [];
+    
+    for (const doc of snapshot.docs) {
+      const collabData = doc.data();
+      const userDoc = await usersRef.doc(collabData.userId).get();
+      
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        collaborators.push({
+          id: doc.id,
+          userId: {
+            id: userDoc.id,
+            username: userData.username,
+            email: userData.email
+          },
+          role: collabData.role,
+          groupId: collabData.groupId
+        });
+      }
+    }
+    
     res.status(200).json(collaborators);
   } catch (error) {
-    console.error('Error al obtener los colaboradores:', error);
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
 });
 
 app.get('/api/groups', authenticateToken, async (req, res) => {
   try {
+    const collaboratorsRef = db.collection('collaborators');
+    const collabSnapshot = await collaboratorsRef.where('userId', '==', req.user.userId).get();
     
-    const groups = await Collaborator.find({ userId: req.user.userId })
-      .populate('groupId')
-      .populate({
-        path: 'groupId',
-        populate: {
-          path: 'admin',
-          select: 'username', 
-        },
-      });
-
+    const groupsRef = db.collection('groups');
+    const usersRef = db.collection('users');
+    
+    const groups = [];
+    
+    for (const doc of collabSnapshot.docs) {
+      const collabData = doc.data();
+      const groupDoc = await groupsRef.doc(collabData.groupId).get();
+      
+      if (groupDoc.exists) {
+        const groupData = groupDoc.data();
+        const adminDoc = await usersRef.doc(groupData.admin).get();
+        
+        let adminUsername = "Desconocido";
+        if (adminDoc.exists) {
+          adminUsername = adminDoc.data().username;
+        }
+        
+        groups.push({
+          id: doc.id,
+          groupId: {
+            id: groupDoc.id,
+            name: groupData.name,
+            admin: {
+              id: groupData.admin,
+              username: adminUsername
+            },
+            createdAt: groupData.createdAt
+          },
+          role: collabData.role,
+          userId: req.user.userId
+        });
+      }
+    }
+    
     res.status(200).json(groups);
   } catch (error) {
     res.status(500).json({ message: 'Error al obtener los grupos', error: error.message });
@@ -404,30 +518,44 @@ app.post('/api/groups/:groupId/tasks', authenticateToken, async (req, res) => {
     const { groupId } = req.params;
     const { name, status, description, deadline, category, assignedTo } = req.body;
 
-    const collaborator = await Collaborator.findOne({ groupId, userId: req.user.userId });
-    if (!collaborator) {
+    const collaboratorsRef = db.collection('collaborators');
+    const collabSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    if (collabSnapshot.empty) {
       return res.status(403).json({ message: 'No tienes acceso a este grupo' });
     }
+    
     if (assignedTo) {
-      const assignedCollaborator = await Collaborator.findOne({ groupId, userId: assignedTo });
-      if (!assignedCollaborator) {
+      const assignedCollabSnapshot = await collaboratorsRef
+        .where('groupId', '==', groupId)
+        .where('userId', '==', assignedTo)
+        .get();
+        
+      if (assignedCollabSnapshot.empty) {
         return res.status(400).json({ message: 'El usuario asignado no es un colaborador del grupo' });
       }
     }
 
-    const newGroupTask = new GroupTask({
+    const newGroupTask = {
       name,
       status,
       description,
-      deadline,
+      deadline: deadline ? new Date(deadline) : null,
       category,
       groupId,
       createdBy: req.user.userId,
       assignedTo,
-    });
+      completedBy: null,
+      completedAt: null
+    };
 
-    await newGroupTask.save();
-    res.status(201).json({ message: 'Tarea creada exitosamente', task: newGroupTask });
+    const taskRef = await db.collection('groupTasks').add(newGroupTask);
+    const taskWithId = { id: taskRef.id, ...newGroupTask };
+    
+    res.status(201).json({ message: 'Tarea creada exitosamente', task: taskWithId });
   } catch (error) {
     res.status(500).json({ message: 'Error al crear la tarea', error: error.message });
   }
@@ -437,28 +565,77 @@ app.get('/api/groups/:groupId/tasks', authenticateToken, async (req, res) => {
   try {
     const { groupId } = req.params;
 
-    const group = await Group.findById(groupId);
-    if (!group) {
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    
+    if (!groupDoc.exists) {
       return res.status(404).json({ message: 'Grupo no encontrado' });
     }
 
-    const collaborator = await Collaborator.findOne({ groupId, userId: req.user.userId });
-    if (!collaborator) {
+    const collaboratorsRef = db.collection('collaborators');
+    const collabSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    if (collabSnapshot.empty) {
       return res.status(403).json({ message: 'No tienes acceso a este grupo' });
     }
-
-    let tasks;
-    if (collaborator.role === 'admin') {
-      tasks = await GroupTask.find({ groupId }).populate('createdBy', 'username').populate('assignedTo', 'username');
+    
+    const collabData = collabSnapshot.docs[0].data();
+    const tasksRef = db.collection('groupTasks');
+    let tasksSnapshot;
+    
+    if (collabData.role === 'admin') {
+      tasksSnapshot = await tasksRef.where('groupId', '==', groupId).get();
     } else {
-      tasks = await GroupTask.find({ groupId, $or: [{ assignedTo: req.user.userId }, { createdBy: req.user.userId }] })
-        .populate('createdBy', 'username')
-        .populate('assignedTo', 'username');
+      tasksSnapshot = await tasksRef
+        .where('groupId', '==', groupId)
+        .where(admin.firestore.FieldPath.documentId(), 'in', [
+          admin.firestore.FieldPath.documentId().where('assignedTo', '==', req.user.userId),
+          admin.firestore.FieldPath.documentId().where('createdBy', '==', req.user.userId)
+        ])
+        .get();
     }
-
+    
+    const usersRef = db.collection('users');
+    const tasks = [];
+    
+    for (const doc of tasksSnapshot.docs) {
+      const taskData = doc.data();
+      
+      let createdByUser = null;
+      if (taskData.createdBy) {
+        const createdByDoc = await usersRef.doc(taskData.createdBy).get();
+        if (createdByDoc.exists) {
+          createdByUser = {
+            id: createdByDoc.id,
+            username: createdByDoc.data().username
+          };
+        }
+      }
+      
+      let assignedToUser = null;
+      if (taskData.assignedTo) {
+        const assignedToDoc = await usersRef.doc(taskData.assignedTo).get();
+        if (assignedToDoc.exists) {
+          assignedToUser = {
+            id: assignedToDoc.id,
+            username: assignedToDoc.data().username
+          };
+        }
+      }
+      
+      tasks.push({
+        id: doc.id,
+        ...taskData,
+        createdBy: createdByUser,
+        assignedTo: assignedToUser
+      });
+    }
+    
     res.status(200).json(tasks);
   } catch (error) {
-    console.error('Error en el servidor:', error);
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
 });
@@ -467,22 +644,36 @@ app.put('/api/groups/:groupId/tasks/:taskId/complete', authenticateToken, async 
   try {
     const { groupId, taskId } = req.params;
 
-    const collaborator = await Collaborator.findOne({ groupId, userId: req.user.userId });
-    if (!collaborator) {
+    const collaboratorsRef = db.collection('collaborators');
+    const collabSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    if (collabSnapshot.empty) {
       return res.status(403).json({ message: 'No tienes acceso a este grupo' });
     }
 
-    const task = await GroupTask.findById(taskId);
-    if (!task) {
+    const taskRef = db.collection('groupTasks').doc(taskId);
+    const taskDoc = await taskRef.get();
+    
+    if (!taskDoc.exists) {
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
 
-    task.status = 'completada';
-    task.completedBy = req.user.userId;
-    task.completedAt = new Date();
-
-    await task.save();
-    res.status(200).json({ message: 'Tarea completada exitosamente', task });
+    await taskRef.update({
+      status: 'completada',
+      completedBy: req.user.userId,
+      completedAt: admin.firestore.Timestamp.now()
+    });
+    
+    const updatedTaskDoc = await taskRef.get();
+    const updatedTask = {
+      id: updatedTaskDoc.id,
+      ...updatedTaskDoc.data()
+    };
+    
+    res.status(200).json({ message: 'Tarea completada exitosamente', task: updatedTask });
   } catch (error) {
     res.status(500).json({ message: 'Error al completar la tarea', error: error.message });
   }
@@ -493,24 +684,45 @@ app.put('/api/groups/:groupId/tasks/:taskId', authenticateToken, async (req, res
     const { groupId, taskId } = req.params;
     const { name, status, description, deadline, category, assignedTo } = req.body;
 
-    const collaborator = await Collaborator.findOne({ groupId, userId: req.user.userId });
-    if (!collaborator) {
+    const collaboratorsRef = db.collection('collaborators');
+    const collabSnapshot = await collaboratorsRef
+      .where('groupId', '==', groupId)
+      .where('userId', '==', req.user.userId)
+      .get();
+
+    if (collabSnapshot.empty) {
       return res.status(403).json({ message: 'No tienes acceso a este grupo' });
     }
 
-    const updatedTask = await GroupTask.findByIdAndUpdate(
-      taskId,
-      { name, status, description, deadline, category, assignedTo },
-      { new: true }
-    );
-
-    if (!updatedTask) {
+    const taskRef = db.collection('groupTasks').doc(taskId);
+    const taskDoc = await taskRef.get();
+    
+    if (!taskDoc.exists) {
       return res.status(404).json({ message: 'Tarea no encontrada' });
     }
-
+    
+    const updateData = {
+      name,
+      status,
+      description,
+      category,
+      assignedTo
+    };
+    
+    if (deadline) {
+      updateData.deadline = new Date(deadline);
+    }
+    
+    await taskRef.update(updateData);
+    
+    const updatedTaskDoc = await taskRef.get();
+    const updatedTask = {
+      id: updatedTaskDoc.id,
+      ...updatedTaskDoc.data()
+    };
+    
     res.status(200).json({ message: 'Tarea actualizada exitosamente', task: updatedTask });
   } catch (error) {
-    console.error('Error al actualizar la tarea:', error);
     res.status(500).json({ message: 'Error en el servidor', error: error.message });
   }
 });
